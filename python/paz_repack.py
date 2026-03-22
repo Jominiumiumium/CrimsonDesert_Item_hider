@@ -84,12 +84,35 @@ def _pad_to_orig_size(data: bytes, orig_size: int) -> bytes:
     return data + b'\x00' * (orig_size - len(data))
 
 
+def _find_xml_comments(data: bytes) -> list[tuple[int, int]]:
+    """Find all XML comment bodies (content between <!-- and -->).
+
+    Returns list of (start, end) byte offsets for the comment content
+    (not including the delimiters themselves).
+    """
+    comments = []
+    search_from = 0
+    while True:
+        start = data.find(b'<!--', search_from)
+        if start == -1:
+            break
+        content_start = start + 4
+        end = data.find(b'-->', content_start)
+        if end == -1:
+            break
+        if end > content_start:
+            comments.append((content_start, end))
+        search_from = end + 3
+    return comments
+
+
 def _match_compressed_size(plaintext: bytes, target_comp_size: int,
                            target_orig_size: int) -> bytes:
     """Adjust plaintext so it compresses to exactly target_comp_size.
 
-    For XML files, inserts padding elements and tunes compressibility.
-    For non-XML, pads with zeros and hopes for the best.
+    Strategy: find individual byte positions where replacing with a space
+    changes the LZ4 compressed output size by the needed amount. Tries
+    XML comment content first, then other non-critical positions.
 
     Returns:
         adjusted plaintext (exactly target_orig_size bytes)
@@ -97,55 +120,85 @@ def _match_compressed_size(plaintext: bytes, target_comp_size: int,
     Raises:
         ValueError if size matching fails
     """
-    # Pad to orig_size first
     padded = _pad_to_orig_size(plaintext, target_orig_size)
 
     comp = lz4.block.compress(padded, store_size=False)
     if len(comp) == target_comp_size:
         return padded
 
-    # If under target, reduce compressibility by replacing trailing zeros
-    # with incompressible bytes
-    filler = bytes(range(33, 127))  # printable ASCII
+    delta = len(comp) - target_comp_size  # positive = need to shrink
 
-    if len(comp) < target_comp_size:
-        # Replace trailing bytes with incompressible content
-        # Binary search for the right amount
-        lo, hi = 0, target_orig_size - len(plaintext)
-        best = padded
-        for _ in range(64):
+    # Collect candidate positions: comment bytes first, then all non-space bytes
+    comments = _find_xml_comments(padded)
+    comment_positions = set()
+    for cstart, cend in comments:
+        for i in range(cstart, cend):
+            if padded[i:i+1] != b' ':
+                comment_positions.add(i)
+
+    # Try comment positions first (safest), then scan all positions
+    candidates = sorted(comment_positions)
+    candidates_set = set(candidates)
+
+    # Phase 1: single-byte replacements in comments
+    for i in candidates:
+        trial = bytearray(padded)
+        trial[i] = 0x20
+        c = lz4.block.compress(bytes(trial), store_size=False)
+        if len(c) == target_comp_size:
+            return bytes(trial)
+
+    # Phase 2: single-byte replacements across the whole file
+    # Sample positions evenly to avoid scanning all 290k bytes
+    step = max(1, len(padded) // 5000)
+    for i in range(0, len(padded), step):
+        if padded[i:i+1] == b' ' or i in candidates_set:
+            continue
+        trial = bytearray(padded)
+        trial[i] = 0x20
+        c = lz4.block.compress(bytes(trial), store_size=False)
+        if len(c) == target_comp_size:
+            return bytes(trial)
+
+    # Phase 3: full scan if sampling missed
+    for i in range(len(padded)):
+        if padded[i:i+1] == b' ' or i in candidates_set:
+            continue
+        trial = bytearray(padded)
+        trial[i] = 0x20
+        c = lz4.block.compress(bytes(trial), store_size=False)
+        if len(c) == target_comp_size:
+            return bytes(trial)
+
+    # Phase 4: try multi-byte replacements for larger deltas
+    if abs(delta) > 1:
+        # Binary search over number of comment bytes to replace
+        lo, hi = 0, len(candidates)
+        while lo <= hi:
             mid = (lo + hi) // 2
-            if mid <= 0:
-                break
-            fill = (filler * (mid // len(filler) + 1))[:mid]
-            trial = plaintext + fill
-            trial = _pad_to_orig_size(trial, target_orig_size)
-            c = lz4.block.compress(trial, store_size=False)
+            trial = bytearray(padded)
+            for idx in candidates[:mid]:
+                trial[idx] = 0x20
+            c = lz4.block.compress(bytes(trial), store_size=False)
             if len(c) == target_comp_size:
-                return trial
-            elif len(c) < target_comp_size:
+                return bytes(trial)
+            elif len(c) > target_comp_size:
                 lo = mid + 1
-                best = trial
             else:
                 hi = mid - 1
 
-        # Linear scan near the boundary
-        for n in range(max(0, lo - 5), min(hi + 5, target_orig_size - len(plaintext))):
-            fill = (filler * (n // len(filler) + 1))[:n] if n > 0 else b''
-            trial = plaintext + fill
-            trial = _pad_to_orig_size(trial, target_orig_size)
-            c = lz4.block.compress(trial, store_size=False)
+        # Linear scan near boundary
+        for n in range(max(0, lo - 20), min(lo + 20, len(candidates) + 1)):
+            trial = bytearray(padded)
+            for idx in candidates[:n]:
+                trial[idx] = 0x20
+            c = lz4.block.compress(bytes(trial), store_size=False)
             if len(c) == target_comp_size:
-                return trial
-
-    if len(comp) > target_comp_size:
-        raise ValueError(
-            f"Compressed size {len(comp)} exceeds target {target_comp_size}. "
-            f"Reduce file content.")
+                return bytes(trial)
 
     raise ValueError(
         f"Cannot match target comp_size {target_comp_size} "
-        f"(best: {len(lz4.block.compress(padded, store_size=False))})")
+        f"(got {len(comp)}, delta {delta})")
 
 
 # ── Core repack ──────────────────────────────────────────────────────
