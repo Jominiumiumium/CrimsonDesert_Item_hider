@@ -214,21 +214,22 @@ def _inflate_with_comments(padded: bytes, plaintext_len: int,
                            target_orig_size: int) -> bytes | None:
     """Inflate compressed size to exactly target_comp_size.
 
-    Two strategies, tried in order:
+    Three strategies, tried in order:
 
-    1. Replace zero bytes in the trailing padding with spaces. Each
-       replacement breaks the LZ4 zero-run slightly, adding ~1 byte to
-       the compressed output. Works well for small deltas (< ~20 bytes).
+    1. Replace zero bytes in the trailing padding with spaces. Works well
+       for small deltas when there is padding room.
 
-    2. Insert an XML comment with base64-encoded random (incompressible)
-       content into the trailing padding. Binary-search the body length.
-       Works for larger deltas where strategy 1 can't reach.
+    2. Insert an XML comment with incompressible content into the trailing
+       padding. Binary-search the body length. Works for larger deltas
+       when there is padding room.
+
+    3. Replace existing XML comment body bytes with incompressible content
+       in-place (same byte count). Works when plaintext fills orig_size
+       completely and there is no padding room at all.
 
     Returns adjusted plaintext (exactly target_orig_size bytes) or None.
     """
     padding_available = target_orig_size - plaintext_len
-    if padding_available <= 0:
-        return None
 
     base_comp = len(lz4.block.compress(padded, store_size=False))
     needed = target_comp_size - base_comp  # positive = need to add bytes
@@ -237,72 +238,122 @@ def _inflate_with_comments(padded: bytes, plaintext_len: int,
         return None
 
     # ── Strategy 1: replace zero bytes in padding with spaces ──────────
-    # Binary search over how many zeros to replace
-    max_replaceable = padding_available
+    if padding_available > 0:
+        max_replaceable = padding_available
 
-    def _build_zero_trial(n: int) -> bytes:
-        trial = bytearray(padded)
-        for i in range(n):
-            trial[plaintext_len + i] = 0x20
-        return bytes(trial)
+        def _build_zero_trial(n: int) -> bytes:
+            trial = bytearray(padded)
+            for i in range(n):
+                trial[plaintext_len + i] = 0x20
+            return bytes(trial)
 
-    c_one = len(lz4.block.compress(_build_zero_trial(1), store_size=False))
-    if c_one <= target_comp_size:
-        # Each replacement adds roughly the same amount — binary search
-        lo, hi = 1, max_replaceable
+        c_one = len(lz4.block.compress(_build_zero_trial(1), store_size=False))
+        if c_one <= target_comp_size:
+            lo, hi = 1, max_replaceable
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                c = len(lz4.block.compress(_build_zero_trial(mid), store_size=False))
+                if c == target_comp_size:
+                    return _build_zero_trial(mid)
+                elif c < target_comp_size:
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+            for n in range(max(1, lo - 5), min(lo + 5, max_replaceable + 1)):
+                trial = _build_zero_trial(n)
+                if len(lz4.block.compress(trial, store_size=False)) == target_comp_size:
+                    return trial
+
+    # ── Strategy 2: XML comment with incompressible content ────────────
+    if padding_available >= 8:
+        max_body = padding_available - 7  # 7 = len("<!---->")
+        rand_body = _make_xml_safe_incompressible(max_body)
+
+        def _build_comment_trial(body_len: int) -> bytes:
+            body = rand_body[:body_len]
+            comment = b'<!--' + body + b'-->'
+            trial = padded[:plaintext_len] + comment
+            if len(trial) < target_orig_size:
+                trial = trial + b'\x00' * (target_orig_size - len(trial))
+            else:
+                trial = trial[:target_orig_size]
+            return trial
+
+        c_min = len(lz4.block.compress(_build_comment_trial(0), store_size=False))
+        c_max = len(lz4.block.compress(_build_comment_trial(max_body), store_size=False))
+        if c_min <= target_comp_size <= c_max:
+            lo, hi = 0, max_body
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                trial = _build_comment_trial(mid)
+                c = lz4.block.compress(trial, store_size=False)
+                if len(c) == target_comp_size:
+                    return trial
+                elif len(c) < target_comp_size:
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+            for n in range(max(0, lo - 20), min(lo + 20, max_body + 1)):
+                trial = _build_comment_trial(n)
+                if len(lz4.block.compress(trial, store_size=False)) == target_comp_size:
+                    return trial
+
+    return None
+
+
+def _inflate_by_replacing_comment_bodies(padded: bytes, target_comp_size: int) -> bytes | None:
+    """Strategy 3: replace existing XML comment body bytes with incompressible
+    content in-place (same byte count, no size change).
+
+    Tries multiple random fills — each gives a different compressed-size curve,
+    so retrying finds one where the target is reachable.
+
+    Returns adjusted data or None.
+    """
+    comments = _find_xml_comments(padded)
+    if not comments:
+        return None
+
+    positions = [i for cstart, cend in comments for i in range(cstart, cend)]
+    if not positions:
+        return None
+
+    total = len(positions)
+
+    def _try_fill(rand_fill: bytes) -> bytes | None:
+        def _build_trial(n: int) -> bytes:
+            trial = bytearray(padded)
+            for idx, pos in enumerate(positions[:n]):
+                trial[pos] = rand_fill[idx]
+            return bytes(trial)
+
+        c_none = len(lz4.block.compress(_build_trial(0), store_size=False))
+        c_all  = len(lz4.block.compress(_build_trial(total), store_size=False))
+        if target_comp_size < c_none or target_comp_size > c_all:
+            return None
+
+        lo, hi = 0, total
         while lo <= hi:
             mid = (lo + hi) // 2
-            c = len(lz4.block.compress(_build_zero_trial(mid), store_size=False))
+            c = len(lz4.block.compress(_build_trial(mid), store_size=False))
             if c == target_comp_size:
-                return _build_zero_trial(mid)
+                return _build_trial(mid)
             elif c < target_comp_size:
                 lo = mid + 1
             else:
                 hi = mid - 1
-        # Linear scan near boundary
-        for n in range(max(1, lo - 5), min(lo + 5, max_replaceable + 1)):
-            trial = _build_zero_trial(n)
-            if len(lz4.block.compress(trial, store_size=False)) == target_comp_size:
-                return trial
 
-    # ── Strategy 2: XML comment with incompressible content ────────────
-    if padding_available < 8:  # need at least <!--X-->
+        # Linear scan near boundary — wider window since curve isn't perfectly monotonic
+        for n in range(max(0, lo - 50), min(lo + 50, total + 1)):
+            if len(lz4.block.compress(_build_trial(n), store_size=False)) == target_comp_size:
+                return _build_trial(n)
+
         return None
 
-    max_body = padding_available - 7  # 7 = len("<!---->")
-    rand_body = _make_xml_safe_incompressible(max_body)
-
-    def _build_comment_trial(body_len: int) -> bytes:
-        body = rand_body[:body_len]
-        comment = b'<!--' + body + b'-->'
-        trial = padded[:plaintext_len] + comment
-        if len(trial) < target_orig_size:
-            trial = trial + b'\x00' * (target_orig_size - len(trial))
-        else:
-            trial = trial[:target_orig_size]
-        return trial
-
-    c_min = len(lz4.block.compress(_build_comment_trial(0), store_size=False))
-    c_max = len(lz4.block.compress(_build_comment_trial(max_body), store_size=False))
-    if target_comp_size < c_min or target_comp_size > c_max:
-        return None
-
-    lo, hi = 0, max_body
-    while lo <= hi:
-        mid = (lo + hi) // 2
-        trial = _build_comment_trial(mid)
-        c = lz4.block.compress(trial, store_size=False)
-        if len(c) == target_comp_size:
-            return trial
-        elif len(c) < target_comp_size:
-            lo = mid + 1
-        else:
-            hi = mid - 1
-
-    for n in range(max(0, lo - 20), min(lo + 20, max_body + 1)):
-        trial = _build_comment_trial(n)
-        if len(lz4.block.compress(trial, store_size=False)) == target_comp_size:
-            return trial
+    for _ in range(8):
+        result = _try_fill(_make_xml_safe_incompressible(total))
+        if result is not None:
+            return result
 
     return None
 
@@ -336,9 +387,12 @@ def _match_compressed_size(plaintext: bytes, target_comp_size: int,
     # Branch based on direction needed
     if delta < 0:
         # Need to INFLATE: compressed output is too small.
-        # Insert/expand XML comments with incompressible content.
         result = _inflate_with_comments(padded, len(plaintext),
                                         target_comp_size, target_orig_size)
+        if result is not None:
+            return result
+        # Fallback: replace existing comment bodies with incompressible content
+        result = _inflate_by_replacing_comment_bodies(padded, target_comp_size)
         if result is not None:
             return result
         raise ValueError(
