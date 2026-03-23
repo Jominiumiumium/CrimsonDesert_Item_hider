@@ -1,6 +1,8 @@
-# CDItemVisibilityPatcher
+# CrimsonDesertItemVisibilityPatcher
+Thanks to lazorr410 for the unpacking tool!
+My gui/tool is 110% Cuck coded
 
-A simple patcher to change item visibility in Crimson Desert.
+A patcher to change item visibility in Crimson Desert.
 
 ## Overview
 
