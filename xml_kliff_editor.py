@@ -207,11 +207,29 @@ class KliffEditor(tk.Tk):
                 var = tk.BooleanVar(value=False)
                 self.check_vars[part] = var
                 display = part.replace("CD_", "").replace("_", " ")
-                cb = tk.Checkbutton(self.scroll_frame, text=display, variable=var, anchor="w")
-                cb.pack(fill=tk.X, padx=20)
+                
+                row = tk.Frame(self.scroll_frame)
+                row.pack(fill=tk.X, padx=20)
+                
+                status_var = tk.StringVar(value="Visible")
+                lbl_status = tk.Label(row, textvariable=status_var, fg="#228b22", font=("Arial", 9, "bold"), width=7, anchor="w")
+                lbl_status.pack(side=tk.LEFT)
+                
+                def update_status(*args, v=var, s=status_var, l=lbl_status):
+                    if v.get():
+                        s.set("Hidden")
+                        l.config(fg="#b22222")
+                    else:
+                        s.set("Visible")
+                        l.config(fg="#228b22")
+                        
+                var.trace_add("write", update_status)
+                
+                cb = tk.Checkbutton(row, text=display, variable=var, anchor="w")
+                cb.pack(side=tk.LEFT, fill=tk.X)
 
         # --- Bottom help ---
-        help_text = "Check items to enable Visible=\"Out\". Uncheck to remove it.\nClick Apply Changes to write edits into the PAZ archive."
+        help_text = "Check items to enable Visible=\"Out\" (which hides them).\nUncheck to remove it (which shows them).\nClick Apply Changes to write edits into the PAZ archive."
         tk.Label(self, text=help_text, justify=tk.LEFT, fg="#555555", padx=10).pack(side=tk.BOTTOM, anchor="w", pady=(0, 5))
 
     # ------------------------------------------------------------------
